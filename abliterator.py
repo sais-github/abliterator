@@ -130,8 +130,11 @@ class ModelAbliterator:
             n_devices=n_devices,
             device=device,
             dtype=torch.bfloat16,
-            default_padding_side='left'
+            default_padding_side='left',
+            trust_remote_code=True, # <--- ADD THIS LINE (don't forget the comma!)
         )
+
+        self.model.requires_grad_(False)
 
         self.model.requires_grad_(False)
 
