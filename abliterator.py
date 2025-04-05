@@ -103,22 +103,19 @@ class ChatTemplate:
 LLAMA3_CHAT_TEMPLATE = """<|start_header_id|>user<|end_header_id|>\n{instruction}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"""
 PHI3_CHAT_TEMPLATE = """<|user|>\n{instruction}<|end|>\n<|assistant|>"""
 
-# (Keep imports and other functions/classes the same)
-
 class ModelAbliterator:
     def __init__(
         self,
         model: str,
         dataset: Tuple[List[str], List[str]]|List[Tuple[List[str], List[str]]],
-        device: str = 'cuda',
+        device: str = 'cuda', # Still useful as a fallback if device_map is None
         n_devices: int = None,
         cache_fname: str = None,
         activation_layers: List[str] = ['resid_pre',  'resid_post', 'mlp_out', 'attn_out'],
         chat_template: str = None,
         positive_toks: List[int]|Tuple[int]|Set[int]|Int[Tensor, '...'] = None,
         negative_toks: List[int]|Tuple[int]|Set[int]|Int[Tensor, '...'] = None,
-        # <<< ADDED: New parameters for quantization >>>
-        load_in_8bit: bool = False,
+        # <<< MODIFIED: Only device_map parameter added >>>
         device_map: str | Dict = None  # Accept device_map argument
     ):
         self.MODEL_PATH = model
@@ -130,29 +127,24 @@ class ModelAbliterator:
         # Save memory
         torch.set_grad_enabled(False)
 
-        # <<< MODIFIED: Prepare arguments for from_pretrained >>>
+        # <<< MODIFIED: Prepare arguments for from_pretrained, prioritizing device_map >>>
         hf_load_kwargs = {
-            "n_devices": n_devices,
+            "n_devices": n_devices, # May be ignored by device_map, but keep for potential TL use
             "default_padding_side": 'left',
         }
 
-        # Add quantization/device_map arguments if provided
-        if load_in_8bit:
-            print("INFO: Enabling 8-bit quantization.")
-            hf_load_kwargs["load_in_8bit"] = True
-            # device_map is often required or recommended with load_in_8bit
-            if device_map is None:
-                print("INFO: Setting device_map='auto' for 8-bit loading.")
-                hf_load_kwargs["device_map"] = "auto"
-            else:
-                 hf_load_kwargs["device_map"] = device_map
-            # Don't specify dtype or device when using device_map or load_in_8bit
-        elif device_map:
+        if device_map:
              print(f"INFO: Using device_map: {device_map}")
              hf_load_kwargs["device_map"] = device_map
-             # Don't specify dtype or device when using device_map
+             # Don't explicitly set device or dtype when using device_map,
+             # let transformers/accelerate handle it. It usually defaults to model's native dtype.
+             # We might need to remove 'device' if it causes conflict with device_map.
+             # Let's try keeping 'device' initially, TL might use it for something else.
+             # If errors occur, remove the 'device' key when device_map is active.
+             # hf_load_kwargs["device"] = device # Keep for now, remove if problematic
         else:
-            # Original behavior if not quantizing or using device_map
+            # Original behavior if not using device_map
+            print(f"INFO: No device_map provided, using device='{device}' and dtype=torch.bfloat16")
             hf_load_kwargs["device"] = device
             hf_load_kwargs["dtype"] = torch.bfloat16
 
@@ -162,15 +154,28 @@ class ModelAbliterator:
              print(f"  {key}: {value}")
         print(f"-----------------------------------------")
 
-        self.model = HookedTransformer.from_pretrained_no_processing(
-            model,
-            **hf_load_kwargs # Pass the prepared arguments using dictionary unpacking
-        )
+        try:
+            self.model = HookedTransformer.from_pretrained_no_processing(
+                model,
+                **hf_load_kwargs # Pass the prepared arguments using dictionary unpacking
+            )
+        except TypeError as e:
+             # If the 'device' argument conflicts with 'device_map' inside TL/HF
+             if "got multiple values for keyword argument 'device'" in str(e) and device_map:
+                 print("WARN: Caught TypeError related to 'device' and 'device_map'. Retrying without explicit 'device' argument.")
+                 del hf_load_kwargs['device'] # Remove conflicting argument
+                 self.model = HookedTransformer.from_pretrained_no_processing(
+                     model,
+                     **hf_load_kwargs
+                 )
+             else:
+                 raise e # Re-raise other TypeErrors
+
         print("--- HookedTransformer Loaded ---")
 
         self.model.requires_grad_(False)
 
-        # --- Rest of the __init__ method ---
+        # --- Rest of the __init__ method (should be the same as the previous correct version) ---
         self.model.tokenizer.padding_side = 'left'
         if self.model.tokenizer.pad_token is None:
              print("WARNING: pad_token not set, using eos_token.")
@@ -200,18 +205,15 @@ class ModelAbliterator:
                  print(f"WARNING: Error loading cache file {cache_fname}: {e}. Starting fresh.")
 
 
-        # Handle single or multiple datasets
+        # Handle single or multiple datasets (same logic as before)
         if isinstance(dataset, list) and len(dataset) == 2 and isinstance(dataset[0], tuple):
-             # Assume format: [ (harmful_train, harmful_test), (harmless_train, harmless_test) ]
              self.harmful_inst_train, self.harmful_inst_test = dataset[0]
              self.harmless_inst_train, self.harmless_inst_test = dataset[1]
         elif isinstance(dataset, list) and len(dataset) == 2 and isinstance(dataset[0], list):
-             # Assume format: [ [harmful_instructions], [harmless_instructions] ] - need splitting
              print("Splitting provided instruction lists into train/test sets.")
              self.harmful_inst_train,self.harmful_inst_test = prepare_dataset(dataset[0])
              self.harmless_inst_train,self.harmless_inst_test = prepare_dataset(dataset[1])
         else:
-             # Fallback or error? Let's assume the second format for now if unsure.
              print("WARNING: Unexpected dataset format. Assuming [ [harmful], [harmless] ] and splitting.")
              self.harmful_inst_train,self.harmful_inst_test = prepare_dataset(dataset[0])
              self.harmless_inst_train,self.harmless_inst_test = prepare_dataset(dataset[1])
@@ -222,15 +224,13 @@ class ModelAbliterator:
         self.activation_layers = [activation_layers] if isinstance(activation_layers, str) else activation_layers
         if negative_toks is None:
             print("WARNING: You've not set 'negative_toks', defaulting to tokens for Llama-3 vocab")
-            # Example Llama-3 refusal tokens (adjust if needed for specific model/use case)
-            self.negative_toks = {4250, 14931, 89735, 20451, 11660, 11458, 956, 29901} # ' cannot', ' unethical', ' sorry', ' illegal', ' harmful', ' inappropriate', '.', ':' etc.
+            self.negative_toks = {4250, 14931, 89735, 20451, 11660, 11458, 956, 29901}
         else:
             self.negative_toks = set(negative_toks) if isinstance(negative_toks, (list, tuple)) else negative_toks
 
         if positive_toks is None:
             print("WARNING: You've not set 'positive_toks', defaulting to tokens for Llama-3 vocab")
-            # Example Llama-3 positive/continuation tokens (adjust if needed)
-            self.positive_toks = {23371, 40914, 32, 1271, 8586, 96556, 78145, 29906} # ' Sure', 'Sure', ' certainly', 'Here', 'Okay', ':', '\n' etc.
+            self.positive_toks = {23371, 40914, 32, 1271, 8586, 96556, 78145, 29906}
         else:
             self.positive_toks = set(positive_toks) if isinstance(positive_toks, (list, tuple)) else positive_toks
         self._blacklisted = set()
