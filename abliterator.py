@@ -103,6 +103,8 @@ class ChatTemplate:
 LLAMA3_CHAT_TEMPLATE = """<|start_header_id|>user<|end_header_id|>\n{instruction}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"""
 PHI3_CHAT_TEMPLATE = """<|user|>\n{instruction}<|end|>\n<|assistant|>"""
 
+# (Keep imports and other functions/classes the same)
+
 class ModelAbliterator:
     def __init__(
         self,
@@ -114,7 +116,10 @@ class ModelAbliterator:
         activation_layers: List[str] = ['resid_pre',  'resid_post', 'mlp_out', 'attn_out'],
         chat_template: str = None,
         positive_toks: List[int]|Tuple[int]|Set[int]|Int[Tensor, '...'] = None,
-        negative_toks: List[int]|Tuple[int]|Set[int]|Int[Tensor, '...'] = None
+        negative_toks: List[int]|Tuple[int]|Set[int]|Int[Tensor, '...'] = None,
+        # <<< ADDED: New parameters for quantization >>>
+        load_in_8bit: bool = False,
+        device_map: str | Dict = None  # Accept device_map argument
     ):
         self.MODEL_PATH = model
         if n_devices is None and torch.cuda.is_available():
@@ -125,52 +130,109 @@ class ModelAbliterator:
         # Save memory
         torch.set_grad_enabled(False)
 
+        # <<< MODIFIED: Prepare arguments for from_pretrained >>>
+        hf_load_kwargs = {
+            "n_devices": n_devices,
+            "default_padding_side": 'left',
+        }
+
+        # Add quantization/device_map arguments if provided
+        if load_in_8bit:
+            print("INFO: Enabling 8-bit quantization.")
+            hf_load_kwargs["load_in_8bit"] = True
+            # device_map is often required or recommended with load_in_8bit
+            if device_map is None:
+                print("INFO: Setting device_map='auto' for 8-bit loading.")
+                hf_load_kwargs["device_map"] = "auto"
+            else:
+                 hf_load_kwargs["device_map"] = device_map
+            # Don't specify dtype or device when using device_map or load_in_8bit
+        elif device_map:
+             print(f"INFO: Using device_map: {device_map}")
+             hf_load_kwargs["device_map"] = device_map
+             # Don't specify dtype or device when using device_map
+        else:
+            # Original behavior if not quantizing or using device_map
+            hf_load_kwargs["device"] = device
+            hf_load_kwargs["dtype"] = torch.bfloat16
+
+        print(f"--- Loading HookedTransformer with args ---")
+        print(f"Model: {model}")
+        for key, value in hf_load_kwargs.items():
+             print(f"  {key}: {value}")
+        print(f"-----------------------------------------")
+
         self.model = HookedTransformer.from_pretrained_no_processing(
             model,
-            n_devices=n_devices,
-            device=device,
-            dtype=torch.bfloat16,
-            default_padding_side='left',
-            trust_remote_code=True, # <--- ADD THIS LINE (don't forget the comma!)
+            **hf_load_kwargs # Pass the prepared arguments using dictionary unpacking
         )
+        print("--- HookedTransformer Loaded ---")
 
         self.model.requires_grad_(False)
 
-        self.model.requires_grad_(False)
-
+        # --- Rest of the __init__ method ---
         self.model.tokenizer.padding_side = 'left'
-        self.model.tokenizer.pad_token = self.model.tokenizer.eos_token
-        self.chat_template = chat_template or ChatTemplate(self,LLAMA3_CHAT_TEMPLATE)
+        if self.model.tokenizer.pad_token is None:
+             print("WARNING: pad_token not set, using eos_token.")
+             self.model.tokenizer.pad_token = self.model.tokenizer.eos_token
+
+        self.chat_template = chat_template or ChatTemplate(self,LLAMA3_CHAT_TEMPLATE) # Use appropriate default
 
         self.hidden_size = self.model.cfg.d_model
-        self.original_state = {k:v.to('cpu') for k,v in self.model.state_dict().items()}
+        # Load original state AFTER model is potentially moved by device_map
+        self.original_state = {k:v.to('cpu', non_blocking=True) for k,v in self.model.state_dict().items()}
         self.harmful = {}
         self.harmless = {}
         self.modified_layers = {'mlp':{}, 'W_O':{}}
         self.checkpoints = []
 
         if cache_fname is not None:
-            outs = torch.load(cache_fname,map_location='cpu')
-            self.harmful,self.harmless,modified_layers,checkpoints = outs[:4]
-            self.checkpoints = checkpoints or []
-            self.modified_layers = modified_layers
+            try:
+                print(f"Loading cache from {cache_fname}...")
+                outs = torch.load(cache_fname,map_location='cpu')
+                self.harmful,self.harmless,modified_layers,checkpoints = outs[:4]
+                self.checkpoints = checkpoints or []
+                self.modified_layers = modified_layers or {'mlp':{}, 'W_O':{}} # Ensure dict exists
+                print("Cache loaded.")
+            except FileNotFoundError:
+                print(f"WARNING: Cache file {cache_fname} not found. Starting fresh.")
+            except Exception as e:
+                 print(f"WARNING: Error loading cache file {cache_fname}: {e}. Starting fresh.")
 
-        self.harmful_inst_train,self.harmful_inst_test = prepare_dataset(dataset[0])
-        self.harmless_inst_train,self.harmless_inst_test = prepare_dataset(dataset[1])
+
+        # Handle single or multiple datasets
+        if isinstance(dataset, list) and len(dataset) == 2 and isinstance(dataset[0], tuple):
+             # Assume format: [ (harmful_train, harmful_test), (harmless_train, harmless_test) ]
+             self.harmful_inst_train, self.harmful_inst_test = dataset[0]
+             self.harmless_inst_train, self.harmless_inst_test = dataset[1]
+        elif isinstance(dataset, list) and len(dataset) == 2 and isinstance(dataset[0], list):
+             # Assume format: [ [harmful_instructions], [harmless_instructions] ] - need splitting
+             print("Splitting provided instruction lists into train/test sets.")
+             self.harmful_inst_train,self.harmful_inst_test = prepare_dataset(dataset[0])
+             self.harmless_inst_train,self.harmless_inst_test = prepare_dataset(dataset[1])
+        else:
+             # Fallback or error? Let's assume the second format for now if unsure.
+             print("WARNING: Unexpected dataset format. Assuming [ [harmful], [harmless] ] and splitting.")
+             self.harmful_inst_train,self.harmful_inst_test = prepare_dataset(dataset[0])
+             self.harmless_inst_train,self.harmless_inst_test = prepare_dataset(dataset[1])
+
 
         self.fwd_hooks = []
         self.modified = False
-        self.activation_layers = [activation_layers] if type(activation_layers) == str else activation_layers
-        if negative_toks == None:
+        self.activation_layers = [activation_layers] if isinstance(activation_layers, str) else activation_layers
+        if negative_toks is None:
             print("WARNING: You've not set 'negative_toks', defaulting to tokens for Llama-3 vocab")
-            self.negative_toks = {4250, 14931, 89735, 20451, 11660, 11458, 956} # llama-3 refusal tokens e.g. ' cannot', ' unethical', ' sorry'
+            # Example Llama-3 refusal tokens (adjust if needed for specific model/use case)
+            self.negative_toks = {4250, 14931, 89735, 20451, 11660, 11458, 956, 29901} # ' cannot', ' unethical', ' sorry', ' illegal', ' harmful', ' inappropriate', '.', ':' etc.
         else:
-            self.negative_toks = negative_toks
-        if positive_toks == None:
+            self.negative_toks = set(negative_toks) if isinstance(negative_toks, (list, tuple)) else negative_toks
+
+        if positive_toks is None:
             print("WARNING: You've not set 'positive_toks', defaulting to tokens for Llama-3 vocab")
-            self.positive_toks = {32,1271,8586,96556,78145}
+            # Example Llama-3 positive/continuation tokens (adjust if needed)
+            self.positive_toks = {23371, 40914, 32, 1271, 8586, 96556, 78145, 29906} # ' Sure', 'Sure', ' certainly', 'Here', 'Okay', ':', '\n' etc.
         else:
-            self.positive_toks = positive_toks
+            self.positive_toks = set(positive_toks) if isinstance(positive_toks, (list, tuple)) else positive_toks
         self._blacklisted = set()
 
     def __enter__(self):
